@@ -21,6 +21,11 @@ import logging
 import numpy as np
 import pandas as pd
 
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
 # Zeyrek log gürültüsünü bastır (analiz sırasında çok sayıda DEBUG/INFO basar)
 logging.getLogger('zeyrek').setLevel(logging.ERROR)
 logging.getLogger('zeyrek.morphology').setLevel(logging.ERROR)
@@ -43,7 +48,6 @@ _ANALYZER = None
 
 
 def _get_analyzer():
-    """Zeyrek MorphAnalyzer'ı tembel (lazy) oluştur, tekrar kullan."""
     global _ANALYZER
     if _ANALYZER is None:
         import zeyrek
@@ -53,16 +57,6 @@ def _get_analyzer():
 
 # 1. Veriyi yükle — koda gömülü etiketli Türkçe yorumlar (HAZIR VERİLDİ)
 def load_data():
-    """
-    Etiketli Türkçe ürün yorumlarını DataFrame olarak döndürür.
-    1 = pozitif, 0 = negatif.
-
-    Bu fonksiyon SANA VERİLDİ — veri koda gömülüdür. Aşağıdaki listeleri
-    'text' ve 'label' sütunlu bir DataFrame'e çevirip döndürmen yeterli.
-
-    Returns:
-        pd.DataFrame: sütunlar ['text', 'label'] (~30 satır, dengeli)
-    """
     pozitif = [
         "Bu ürün harika, çok memnun kaldım kesinlikle tavsiye ederim",
         "Kargo çok hızlı geldi ve paketleme mükemmeldi teşekkürler",
@@ -105,217 +99,104 @@ def load_data():
 
 # 2. Türkçe'ye duyarlı küçük harfe çevirme
 def turkish_lower(text):
-    """
-    Türkçe'ye duyarlı lowercase uygula.
-
-    Python'un str.lower() metodu 'I' → 'i' yapar; ama Türkçe'de:
-      'I' → 'ı'   ve   'İ' → 'i'
-    olmalıdır. Bu yüzden önce bu iki harfi ELLE dönüştür, sonra .lower() çağır.
-
-    Örn: "İSTANBUL" → "istanbul", "IRMAK" → "ırmak", "İyi" → "iyi"
-
-    Args:
-        text: str
-
-    Returns:
-        str: Türkçe'ye duyarlı küçük harfli metin
-
-    İpucu:
-    - text = text.replace('İ', 'i').replace('I', 'ı')
-    - return text.lower()
-    """
+    text = text.replace('İ', 'i').replace('I', 'ı')
+    return text.lower()
     pass
 
 
 # 3. Metni temizle — noktalama ve sayıları at
 def clean_text(text):
-    """
-    Metni temizle:
-    1. turkish_lower ile küçük harfe çevir
-    2. Türkçe harfler (a-z + çğıöşü) ve boşluk DIŞINDAKİ her şeyi (noktalama,
-       rakam) boşlukla değiştir
-    3. Fazla boşlukları teke indir, baştaki/sondaki boşlukları kırp
-
-    Örn: "Harika, çok güzel!!! 123" → "harika çok güzel"
-
-    Args:
-        text: str
-
-    Returns:
-        str: temizlenmiş metin
-
-    İpucu:
-    - import re
-    - text = turkish_lower(text)
-    - text = re.sub(r'[^a-zçğıöşü\\s]', ' ', text)
-    - text = re.sub(r'\\s+', ' ', text).strip()
-    """
+    text = turkish_lower(text)
+    # Türkçe harfler + boşluk dışındaki her şeyi boşlukla değiştir
+    text = re.sub(r'[^a-zçğıöşü\s]', ' ', text)
+    # Fazla boşlukları teke indir
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
     pass
 
 
 # 4. Ön işleme — temizle + stopword çıkar
 def preprocess(text):
-    """
-    Tam ön işleme akışı:
-    1. clean_text(text) (lowercase + noktalama temizliği)
-    2. .split() ile kelimelere ayır
-    3. TURKISH_STOPWORDS içindeki kelimeleri çıkar
-    4. Kalan kelimeleri tek boşlukla birleştirip string döndür
-
-    Örn: "bu ürün ve kargo çok güzel" → "ürün kargo güzel"
-    ('bu', 've', 'çok' stopword olduğu için atılır)
-
-    Args:
-        text: str
-
-    Returns:
-        str: temizlenmiş + stopword'süz metin
-
-    İpucu:
-    - cleaned = clean_text(text)
-    - stop = set(TURKISH_STOPWORDS)  # set → hızlı arama
-    - kept = [w for w in cleaned.split() if w not in stop]
-    - return ' '.join(kept)
-    """
+    cleaned = clean_text(text)
+    words = cleaned.split()
+    stop = set(TURKISH_STOPWORDS)
+    kept = [w for w in words if w not in stop]
+    return ' '.join(kept)
     pass
 
 
 # 5. Zeyrek ile lemmatization (kök bulma) — opsiyonel/ağır
 def lemmatize_words(words):
-    """
-    Zeyrek morfolojik analizörü ile her kelimenin kökünü (lemma) bul.
-    Örn: ["kitaplar", "geldim"] → ["kitap", "gelmek"].
-
-    NOT: Zeyrek YAVAŞTIR — bu yüzden ana pipeline'da (build_pipeline)
-    KULLANILMAZ. Bu fonksiyon sadece Türkçe kök bulmayı göstermek/öğrenmek
-    içindir, ayrı test edilir.
-
-    Args:
-        words: list of str (kelimeler)
-
-    Returns:
-        list of str: her kelimenin kökü (lemma), küçük harfli.
-                     Kök bulunamazsa kelimenin kendisi döner.
-
-    İpucu:
-    - analyzer = _get_analyzer()  # yukarıda hazır verilen yardımcı
-    - result = analyzer.lemmatize(w)
-      → result formatı: [(orijinal_kelime, [lemma1, lemma2, ...])]
-      → ilk lemma: result[0][1][0]
-    - Zeyrek bazen kökü büyük harfle döndürür → turkish_lower ile küçült
-    - Kök bulunamazsa (result boşsa) kelimenin kendisini ekle
-    """
+    analyzer = _get_analyzer()
+    lemmas = []
+    for w in words:
+        result = analyzer.lemmatize(w)
+        # result: [(orijinal_kelime, [lemma1, lemma2, ...])]
+        if result and result[0][1]:
+            lemma = result[0][1][0]
+            lemmas.append(turkish_lower(lemma))
+        else:
+            lemmas.append(turkish_lower(w))
+    return lemmas
     pass
 
 
 # 6. TF-IDF + LogisticRegression pipeline kur
 def build_pipeline():
-    """
-    sklearn Pipeline:
-    - 'tfidf': TfidfVectorizer
-        → preprocessor=preprocess (yukarıda yazdığın Türkçe ön işleme:
-          lowercase + noktalama + stopword temizliği)
-        → analyzer='char_wb', ngram_range=(2, 4)
-          (kelime sınırı içinde KARAKTER n-gramları — Türkçe'nin zengin
-           ekli/çekimli yapısında kelime köklerini ve eklerini yakalar,
-           küçük veri setinde kelime n-gramlarından daha sağlam çalışır)
-    - 'clf': LogisticRegression(max_iter=1000, C=10)
-
-    Returns:
-        sklearn.pipeline.Pipeline
-
-    İpucu:
-    - from sklearn.feature_extraction.text import TfidfVectorizer
-    - from sklearn.linear_model import LogisticRegression
-    - from sklearn.pipeline import Pipeline
-    - TfidfVectorizer(preprocessor=preprocess, analyzer='char_wb',
-                      ngram_range=(2, 4))
-    """
+    return Pipeline([
+        ('tfidf', TfidfVectorizer(
+            preprocessor=preprocess, analyzer='char_wb', ngram_range=(2, 4),
+        )),
+        ('clf', LogisticRegression(max_iter=1000, C=10)),
+    ])
     pass
 
 
 # 7. Modeli eğit
 def train_model(pipe, X, y):
-    """
-    Pipeline'ı fit et ve döndür.
+    pipe.fit(X, y)
+    return pipe
 
-    Args:
-        pipe: build_pipeline'dan dönen pipeline
-        X: ham metinler (pd.Series — vektörize EDİLMEMİŞ)
-        y: etiketler (0/1)
-
-    Returns:
-        Pipeline: fit edilmiş pipeline
-
-    İpucu: pipe.fit(X, y); return pipe
-    """
     pass
 
 
 # 8. Modeli değerlendir → accuracy
 def evaluate(pipe, X, y):
-    """
-    Verilen X, y üzerinde tahmin yap, accuracy (doğruluk) döndür.
+    from sklearn.metrics import accuracy_score
+    y_pred = pipe.predict(X)
+    return float(accuracy_score(y, y_pred))
 
-    Args:
-        pipe: eğitilmiş pipeline
-        X: metinler
-        y: gerçek etiketler
-
-    Returns:
-        float: accuracy
-
-    İpucu:
-    - from sklearn.metrics import accuracy_score
-    - y_pred = pipe.predict(X)
-    - return float(accuracy_score(y, y_pred))
-    """
     pass
 
 
 # 9. Tek bir cümle için duygu tahmini
 def predict_sentiment(pipe, text):
-    """
-    Bir cümle al, "pozitif" veya "negatif" döndür.
-
-    Args:
-        pipe: eğitilmiş pipeline
-        text: str
-
-    Returns:
-        str: "pozitif" (tahmin=1) veya "negatif" (tahmin=0)
-
-    İpucu:
-    - Pipeline tek string değil liste bekler → [text] geç
-    - pred = int(pipe.predict([text])[0])
-    - return "pozitif" if pred == 1 else "negatif"
-    """
+    pred = int(pipe.predict([text])[0])
+    return "pozitif" if pred == 1 else "negatif"
     pass
 
 
 # 10. Tüm pipeline'ı uçtan uca çalıştır
 def run_pipeline():
-    """
-    Uçtan uca akış:
-    1. load_data
-    2. train/test split:
-       train_test_split(df['text'], df['label'], test_size=0.3,
-                        stratify=df['label'], random_state=42)
-    3. build_pipeline → train_model
-    4. evaluate (test accuracy)
-    5. İki örnek tahmin:
-       - Pozitif: "Bu ürün gerçekten harika, çok memnun kaldım tavsiye ederim"
-       - Negatif: "Berbat bir ürün, hiç beğenmedim paramı çöpe attım"
-
-    Returns:
-        dict: {
-            'test_accuracy': float,
-            'sample_positive': str ("pozitif" beklenir),
-            'sample_negative': str ("negatif" beklenir),
-        }
-
-    İpucu: from sklearn.model_selection import train_test_split
-    """
+    df = load_data()
+    X_train, X_test, y_train, y_test = train_test_split(
+        df['text'], df['label'], test_size=0.3, stratify=df['label'],
+        random_state=42,
+    )
+    pipe = build_pipeline()
+    pipe = train_model(pipe, X_train, y_train)
+    acc = evaluate(pipe, X_test, y_test)
+    sample_pos = predict_sentiment(
+        pipe, "Bu ürün gerçekten harika, çok memnun kaldım tavsiye ederim",
+    )
+    sample_neg = predict_sentiment(
+        pipe, "Berbat bir ürün, hiç beğenmedim paramı çöpe attım",
+    )
+    return {
+        'test_accuracy': acc,
+        'sample_positive': sample_pos,
+        'sample_negative': sample_neg,
+    }
     pass
 
 
